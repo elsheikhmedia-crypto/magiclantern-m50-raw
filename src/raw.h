@@ -158,6 +158,12 @@ int raw_lv_shave_right(int offset);
 /* quick check whether the settings from raw_info are still valid (for lv vsync calls) */
 int raw_lv_settings_still_valid();
 
+/* 0 if this camera cannot redirect the LV RAW EDMAC (M50: Canon buffer only) */
+int raw_lv_redirect_supported();
+
+/* 0 if the LV RAW bit depth cannot be changed (M50: always 14-bit for now) */
+int raw_lv_bpp_change_supported();
+
 void raw_set_geometry(int width, int height, int skip_left, int skip_right, int skip_top, int skip_bottom);
 void raw_force_aspect_ratio(int factor_x, int factor_y);
 void raw_set_preview_rect(int x, int y, int w, int h, int obey_info_bars);

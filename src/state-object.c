@@ -83,9 +83,30 @@ int wait_lv_frames(int num_frames)
 
 extern void digic_iso_step();
 
+/* measured LiveView frame period (us, smoothed) and time of the last vsync */
+static volatile uint32_t lv_vsync_period_us = 0;
+static volatile uint32_t lv_vsync_last_us = 0;
+
+/* LiveView frame rate x1000 measured on the vsync hook, 0 if no recent vsync */
+int lv_vsync_fps_x1000()
+{
+    uint32_t now = (uint32_t) get_us_clock();
+    if (!lv_vsync_period_us || now - lv_vsync_last_us > 500000)
+        return 0;
+    return (int)(1000000000ull / lv_vsync_period_us);
+}
+
 static void FAST vsync_func() // called once per frame.. in theory :)
 {
     vsync_counter++;
+
+    {
+        uint32_t now = (uint32_t) get_us_clock();
+        uint32_t dt = now - lv_vsync_last_us;
+        lv_vsync_last_us = now;
+        if (dt > 5000 && dt < 200000)   /* 5..200 fps */
+            lv_vsync_period_us = lv_vsync_period_us ? (lv_vsync_period_us * 15 + dt) / 16 : dt;
+    }
 
     #if defined(CONFIG_MODULES)
     module_exec_cbr(CBR_VSYNC);
@@ -135,6 +156,14 @@ static int state_matrix[num_states][num_inputs];
 #endif
 
 static int (*StateTransition)(void*,int,int,int,int) = 0;
+
+#ifdef CONFIG_EVF_STATE_SYNC
+/* Called right before evfSetParamInterrupt (EVF_STATE input 4 in state 5): Canon's AE has
+ * filled FrameData, SetTgParam has not read it yet. M50 mlv_lite sets its shutter angle here
+ * (FrameData[4] written from CBR_VSYNC_SETPARAM, which runs after, was overwritten by AE). */
+void (*evf_setparam_pre_hook)(void) = 0;
+#endif
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-variable"
 // without this, warns on unused old_state, in some configurations
@@ -196,6 +225,11 @@ static int FAST stateobj_lv_spy(struct state_object * self, int x, int input, in
     {
         display_filter_lv_vsync(old_state, x, input, z, t);
     }
+#endif
+
+#ifdef CONFIG_EVF_STATE_SYNC
+    if (self == EVF_STATE && input == 4 && old_state == 5 && evf_setparam_pre_hook)
+        evf_setparam_pre_hook();
 #endif
 
     int ans = StateTransition(self, x, input, z, t);
@@ -292,7 +326,7 @@ static void state_init(void* unused)
         while(!LV_STATE) msleep(50);
         stateobj_start_spy(LV_STATE, stateobj_lv_spy);
     #endif
-    #ifdef EVF_STATE
+    #if defined(EVF_STATE) && !defined(CONFIG_EVF_STATE_LATE_HOOK)
         stateobj_start_spy(EVF_STATE, stateobj_lv_spy);
     #endif
     
@@ -306,6 +340,29 @@ static void state_init(void* unused)
 }
 
 INIT_FUNC("state_init", state_init);
+
+#if defined(EVF_STATE) && defined(CONFIG_EVF_STATE_LATE_HOOK)
+/* EVF_STATE may still be NULL during INIT_FUNCs (hooking it then crashed in EvfCap).
+ * Wait in a separate task until Canon has created it, check it is a StateObject,
+ * then install the spy. Gives up after 60 s. */
+static void evf_state_hook_task()
+{
+    for (int i = 0; i < 1200; i++)
+    {
+        struct state_object *so = EVF_STATE;
+        if (so && so->type && streq(so->type, "StateObject"))
+        {
+            int err = stateobj_start_spy(so, stateobj_lv_spy);
+            printf("EvfState hook: %s %x -> %s\n", so->name, so, err ? "FAILED" : "installed");
+            return;
+        }
+        msleep(50);
+    }
+    printf("EvfState hook: EVF_STATE not found\n");
+}
+
+TASK_CREATE("evf_hook_task", evf_state_hook_task, 0, 0x1e, 0x1000);
+#endif
 
 #ifdef FEATURE_SHOW_STATE_FPS
 void update_state_fps() {
@@ -329,4 +386,14 @@ void update_state_fps() {
 }
 #endif
 
+#endif
+
+#if !defined(CONFIG_STATE_OBJECT_HOOKS) && defined(LV_RAW_STRUCT_ADDR)
+/* Cameras with LV raw but no state object hooks yet (M50): no vsync counter
+ * to wait on, so wait by time instead. 50 ms covers one frame at 24p and up. */
+int wait_lv_frames(int num_frames)
+{
+    msleep(num_frames * 50);
+    return 1;
+}
 #endif

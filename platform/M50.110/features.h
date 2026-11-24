@@ -23,6 +23,13 @@
 #define FEATURE_GLOBAL_DRAW
 #define FEATURE_CROPMARKS
 
+// LiveView RAW via Canon's LV raw struct (LV_RAW_STRUCT_ADDR in consts.h), see DEV_PLAN.md
+#define CONFIG_RAW_LIVEVIEW
+
+// picture style getters (mlv_lite metadata). Picstyle props are not in
+// property_whitelist.h, so the menu cannot write them yet.
+#define FEATURE_PICSTYLE
+
 // Enable remapping ROM pages to RAM
 #define CONFIG_SGI_HANDLERS
 #define CONFIG_MMU_REMAP

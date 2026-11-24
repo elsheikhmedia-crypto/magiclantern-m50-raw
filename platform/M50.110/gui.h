@@ -25,6 +25,10 @@
 
 #define BGMT_PRESS_HALFSHUTTER       0x5B //unpress 0x5C
 
+/* movie REC button: 0x20 once per press in Show GUI events (preceded by 0x61,
+ * meaning unknown); SX740 documents RECORD = 0x20 too */
+#define BGMT_REC                     0x20
+
 /** WRONG, MAPPED TO M.Fn for now!
  *  Trash button is shared with DOWN on M50. IN LV mode it will not send any
  *  keycode by default. Keycode changes with assigned function in C.Fn.

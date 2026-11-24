@@ -147,7 +147,10 @@ void FAST reverse_bytes_order(char* buf, int32_t count)
         strh r2, [%0]\r\n\
         \
         _wswap_end:\
-        " : : "r"(buf), "r"(count) : "r2", "r3", "r4", "r5", "r6", "r7");
+        " : "+r"(buf), "+r"(count) : : "r2", "r3", "r4", "r5", "r6", "r7", "cc", "memory");
+    /* buf and count are advanced/decremented by the asm, so they must be in/out
+     * operands; as plain inputs, newer GCC reuses the zeroed count register for the
+     * caller's write() size (DNG raw data write of 0 bytes on M50 with GCC 16). */
 #else
     int16_t* buf16 = (int16_t*) buf;
     int32_t i;
@@ -581,7 +584,8 @@ static void create_dng_header(struct raw_info * raw_info){
     if (!dng_header_buf) return;
 
     // create buffer for thumbnail
-    thumbnail_buf = malloc(dng_th_width*dng_th_height*3);
+    /* written to card with FIO_WriteFile, so it needs DMA-capable memory too (DIGIC 8) */
+    thumbnail_buf = umalloc(dng_th_width*dng_th_height*3);
     if (!thumbnail_buf)
     {
         ufree(dng_header_buf);
@@ -676,7 +680,7 @@ static void free_dng_header(void)
     }
     if (thumbnail_buf)
     {
-        free(thumbnail_buf);
+        ufree(thumbnail_buf);
         thumbnail_buf = 0;
     }
 }
@@ -734,22 +738,33 @@ static void create_thumbnail(struct raw_info * raw_info)
 //-------------------------------------------------------------------
 // Write DNG header, thumbnail and data to file
 
+/* last write_dng step reached, for debugging: 1 header created, 2 header written,
+ * 3 thumbnail written, 4 raw data written; negative = that step failed */
+int dng_write_step = 0;
+int dng_write_ret = 0;   /* return value of the last FIO write in write_dng */
+
 static int32_t write_dng(FILE* fd, struct raw_info * raw_info) 
 {
+    dng_write_step = 0;
     create_dng_header(raw_info);
     char* rawadr = (void*)raw_info->buffer;
 
     if (dng_header_buf)
     {
+        dng_write_step = 1;
         create_thumbnail(raw_info);
-        if (write(fd, dng_header_buf, dng_header_buf_size) != dng_header_buf_size) return 0;
-        if (write(fd, thumbnail_buf, dng_th_width*dng_th_height*3) != dng_th_width*dng_th_height*3) return 0;
+        if (write(fd, dng_header_buf, dng_header_buf_size) != dng_header_buf_size) { dng_write_step = -2; return 0; }
+        dng_write_step = 2;
+        if (write(fd, thumbnail_buf, dng_th_width*dng_th_height*3) != dng_th_width*dng_th_height*3) { dng_write_step = -3; return 0; }
+        dng_write_step = 3;
 
         if (!is_lossless_jpeg(raw_info))
         {
             reverse_bytes_order(UNCACHEABLE(rawadr), camera_sensor.raw_size);
         }
-        if (write(fd, UNCACHEABLE(rawadr), camera_sensor.raw_size) != camera_sensor.raw_size) return 0;
+        dng_write_ret = write(fd, UNCACHEABLE(rawadr), camera_sensor.raw_size);
+        if (dng_write_ret != camera_sensor.raw_size) { dng_write_step = -4; return 0; }
+        dng_write_step = 4;
 
         free_dng_header();
     }

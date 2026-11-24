@@ -252,6 +252,7 @@ THUMB_FN(0xe02d40f2,  ShootOlcApp_handler)                  // msg: "StopShootOl
 THUMB_FN(0xe04dc446,  LiveViewApp_handler)                  // msg: "StartLiveViewApp(%#x)"
 //THUMB_FN(0xe0338a10,  LiveViewShutterApp_handler)         // msg: "StartLiveViewShutterApp"
 THUMB_FN(0xe058af54,  PlayMovieGuideApp_handler)            // msg: "StartPlayMovieGuideApp"
+THUMB_FN(0xe0622c9e,  ErrCardForLVApp_handler)              // DlgErrCard.c events; ptr loaded by StartErrCardApp and StartErrCardAppForOverheatedPowerOff
 
 // See R180 stubs.s for details.
 //DATA_PTR(  0xe708,  PlayMain_dialog)                      // in StartPlayMain()
@@ -261,6 +262,27 @@ DATA_PTR(   0x139b8,  LiveViewApp_dialog)                   // in StartLiveViewA
 //DATA_PTR( 0x14fa8,  PlayMovieGuideApp_dialog)             // in StartPlayMovieGuideApp()
 
 
+
+/** EDMAC mem2mem (platform/M50.110/edmac-d8.c), each with 2+ independent signs, camera-tested **/
+// ResLock: EFM/Manager/Ersc, same function gaps as R.180 (+0x10B80)
+THUMB_FN(0xe055819e,  CreateResLockEntry)                   // "EfmErscCreateLockEntry" wrapper, "NULL != hLockEntry" asserts
+THUMB_FN(0xe0558386,  LockEngineResources)                  // EfmErscLockResources asserts, creates "EFM_ERSC_STATIC"
+THUMB_FN(0xe0558426,  UnLockEngineResources)                // EfmErscUnLockResources asserts (YuvResizePath, Mem2MemPath)
+THUMB_FN(0xe0558282,  DeleteResLockEntry)                   // EfmErscDeleteLockEntry assert, CommonLib lock_close
+// PwrMng: ELD/PwrMng/PwrMng.c, list of sub-chips ending with 7, same gap as R.180
+THUMB_FN(0xe0557ece,  PwrMng_WakeSubChips)                  // EldPwrMngEnableSubChip
+THUMB_FN(0xe0557efc,  PwrMng_SuspendSubChips)               // EldPwrMngDisableSubChip
+// EHD/General/MemoryToMemoryEsub5, used by Canon's VShd_ExpandData / DarkCurCor_CopyOB
+THUMB_FN(0xe084de9c,  MemToMemE5_SetupEDMAC)                // {rd, wr}; rd must be 0x3A..0x3F
+THUMB_FN(0xe084df40,  MemToMemE5_RegisterCBR)
+THUMB_FN(0xe084df4a,  MemToMemE5_ResetCBR)
+THUMB_FN(0xe084df26,  MemToMemE5_ClearEdmacCBR)
+THUMB_FN(0xe084df70,  MemToMemE5_SetAddress)                // {src, dst}
+THUMB_FN(0xe084df8a,  MemToMemE5_SetSizeAndMode)            // {src_info*, dst_info*, mode}
+THUMB_FN(0xe084df56,  MemToMemE5_Start)                     // Start(wr), Start(rd), ConnectRead(rd)
+// ELD/Edmac/Edmac.c Pack/Unpack (bit depth conversion), camera-tested on ch61/24
+THUMB_FN(0xe054b99a,  ELD_EdmacSetPack)                     // write ports only (assert Edmac.c:1659); cfg[5]
+THUMB_FN(0xe054ba44,  ELD_EdmacSetUnpack)                   // read ports; cfg[4]
 
 /**
  * STUFF BELOW IS WRONG!

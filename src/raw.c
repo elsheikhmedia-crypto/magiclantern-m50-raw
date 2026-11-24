@@ -136,8 +136,16 @@ static int (*dual_iso_get_dr_improvement)() = MODULE_FUNCTION(dual_iso_get_dr_im
 
 
 #ifdef CONFIG_RAW_LIVEVIEW
+#ifdef LV_RAW_STRUCT_ADDR
+/* DIGIC 8 (M50): Canon keeps LiveView RAW state in a RAM struct, found from lv_raw_dump:
+ * +0x10 width, +0x14 height, +0x40 lv_save_raw flag, +0x44 lv_set_mm flag, +0x58 buffer */
+#define LV_RAW_STRUCT_WIDTH   (LV_RAW_STRUCT_ADDR + 0x10)
+#define LV_RAW_STRUCT_HEIGHT  (LV_RAW_STRUCT_ADDR + 0x14)
+#define LV_RAW_STRUCT_BUFFER  (LV_RAW_STRUCT_ADDR + 0x58)
+#else
 // volatile because this points at some OS managed MMIO
 static volatile struct edmac_mmio *raw_lv_edmac = (struct edmac_mmio *)RAW_LV_EDMAC_CHANNEL_ADDR;
+#endif
 #endif
 
 #endif  /* no CONFIG_EDMAC_RAW_SLURP */
@@ -704,7 +712,9 @@ static int raw_lv_buffer_size = 0;
 /* our default LiveView buffer (which can be DEFAULT_RAW_BUFFER or allocated) */
 static void* raw_get_default_lv_buffer()
 {
-#if !defined(CONFIG_EDMAC_RAW_SLURP)
+#if defined(LV_RAW_STRUCT_ADDR)
+    return CACHEABLE(MEM(LV_RAW_STRUCT_BUFFER));
+#elif !defined(CONFIG_EDMAC_RAW_SLURP)
     return CACHEABLE(shamem_read((uint32_t)&(raw_lv_edmac->ram_addr)));
 #else
     return CACHEABLE(raw_lv_buffer);
@@ -772,6 +782,11 @@ static int raw_lv_get_resolution(int* width, int* height)
     }
 #endif
     return 1;
+
+#elif defined(LV_RAW_STRUCT_ADDR)
+    *width  = MEM(LV_RAW_STRUCT_WIDTH);
+    *height = MEM(LV_RAW_STRUCT_HEIGHT);
+    return (*width > 0 && *height > 0);
 
 #else // ~CONFIG_EDMAC_RAW_SLURP
     /* autodetect raw size from EDMAC */
@@ -1077,6 +1092,13 @@ int raw_update_params_work()
         skip_left   = 100;
         #endif
 
+        #ifdef CONFIG_M50
+        // measured from a 2096x1164 lv_raw_dump in FHD 23.98p (2026-11-02):
+        // optical black is 88 px on the left, 34 px on top -> active 2008x1130
+        skip_top    = 34;
+        skip_left   = 88;
+        #endif
+
         #if defined(CONFIG_70D)
         skip_top    = 28;
         skip_left   = 144; // 146 could work, too
@@ -1228,6 +1250,9 @@ int raw_update_params_work()
         raw_capture_info.skipping_y = 0; raw_capture_info.binning_y  = mv720 ? 5 : 3;
 #elif defined(CONFIG_EOSM)
         raw_capture_info.binning_y  = 1; raw_capture_info.skipping_y = (mv720 || !RECORDING_H264) ? 4 : 2;
+#elif defined(CONFIG_M50)
+        /* photo-mode LV (Open Gate 3:2, 838 lines for 4000) reads 1 line of 5 */
+        raw_capture_info.binning_y  = 1; raw_capture_info.skipping_y = (height < 1000) ? 4 : 2;
 #else
         raw_capture_info.binning_y  = 1; raw_capture_info.skipping_y = mv720 ? 4 : 2;
 #endif
@@ -1388,11 +1413,13 @@ int raw_update_params_work()
          * so we do this by compensating the white level manually
          * warning: this may exceed 16383!
          */
+#ifdef SHAD_GAIN_REGISTER
         int shad_gain = shamem_read(SHAD_GAIN_REGISTER);
 
         raw_info.white_level -= raw_info.black_level;
         raw_info.white_level = raw_info.white_level * 3444 / shad_gain; /* 0.25 EV correction, so LiveView matches CR2 exposure */
         raw_info.white_level += raw_info.black_level;
+#endif
 
         /* in photo LiveView, ISO is not the one selected from Canon menu,
          * so the computed dynamic range has nothing to do with the one from CR2 pics
@@ -2131,10 +2158,23 @@ static void* redirected_raw_buffer = 0;
 #endif
 
 /* to be called from vsync hooks */
+/* 0 when raw_lv_redirect_edmac() is a no-op, so callers must read Canon's buffer */
+int raw_lv_redirect_supported()
+{
+    #if !defined(CONFIG_EDMAC_RAW_SLURP) && defined(LV_RAW_STRUCT_ADDR)
+    return 0;
+    #else
+    return 1;
+    #endif
+}
+
 void FAST raw_lv_redirect_edmac(void* ptr)
 {
     #ifdef CONFIG_EDMAC_RAW_SLURP
     redirected_raw_buffer = (void*) CACHEABLE(ptr);
+    #elif defined(LV_RAW_STRUCT_ADDR)
+    /* no known EDMAC channel to redirect on this camera yet */
+    (void) ptr;
     #else
     raw_lv_edmac->ram_addr = (uint32_t)CACHEABLE(ptr);
     #endif
@@ -2623,9 +2663,27 @@ void raw_lv_release()
     give_semaphore(raw_sem);
 }
 
+/* 0 if raw_lv_request_bpp() cannot change Canon's LV RAW bit depth (M50: stays 14-bit) */
+int raw_lv_bpp_change_supported()
+{
+    #if defined(LV_RAW_STRUCT_ADDR)
+    return 0;
+    #else
+    return 1;
+    #endif
+}
+
 void raw_lv_request_bpp(int bpp)
 {
     take_semaphore(raw_sem, 0);
+
+#if defined(LV_RAW_STRUCT_ADDR)
+    /* M50: the raw bit depth (PACK32) register is not identified yet, and we never
+     * write unverified hardware registers. Canon's LV raw stream stays 14-bit. */
+    (void) bpp;
+    give_semaphore(raw_sem);
+    return;
+#endif
 
     /* raw bit depth setup is done from PACK32_MODE register (mask 0x131) */
     #if defined(CONFIG_DIGIC_45)
@@ -2640,6 +2698,10 @@ void raw_lv_request_bpp(int bpp)
             MODE_12BIT = 0x010,
             MODE_10BIT = 0x000,
         };
+    #elif defined(LV_RAW_STRUCT_ADDR)
+        /* unreachable (early return above); only here so the code below compiles */
+        const uint32_t PACK32_MODE = 0;
+        enum { MODE_16BIT = 0, MODE_14BIT = 0, MODE_12BIT = 0, MODE_10BIT = 0 };
     #elif defined(CONFIG_200D) | defined(CONFIG_6D2) | defined(CONFIG_7D2)
     // FIXME currently doesn't do anything for 6D2 or 7D2 since
     // EngDrvOut() is a nop there.  Some definition of the enum is required to build.

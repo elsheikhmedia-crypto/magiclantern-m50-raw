@@ -24,4 +24,14 @@ int lossless_decompress_raw(
 );
 
 
+/* M50 CRX backend: call on recording start / stop (no-ops elsewhere) */
+void lossless_rec_start();
+void lossless_rec_stop();
+extern int lossless_m50_last_us[4];
+int lossless_m50_prealloc();   /* 1 = encoder input buffer available */
+int lossless_ready();          /* 0 only on M50 without that buffer */
+extern int lossless_m50_round_field;   /* M50: 1 = exact, 3 = 13-bit compact */
+extern int lossless_m50_mode;          /* M50: 0 = 14-bit, 1 = 12-bit lossless, 2 = 10-bit */
+int lossless_m50_extra_regions(int width, int height, uint32_t *addr, int *size);   /* up to 2 regions */
+
 #endif

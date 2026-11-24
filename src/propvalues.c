@@ -161,6 +161,10 @@ bool FAST is_movie_mode()
             && get_expsim() == 2  // movie enabled, but photo display is considered photo mode
             #endif
         ;
+    #elif defined(CONFIG_MOVIE_MODE_IN_SHOOTING_MODE_CUSTOM)
+    /* M50: in movie mode PROP_SHOOTING_MODE_2 holds the movie exposure mode
+     * (M = 3), the dial position (0x14) is only in PROP_SHOOTING_MODE */
+    return shooting_mode_custom == SHOOTMODE_MOVIE;
     #else
     return shooting_mode == SHOOTMODE_MOVIE;
     #endif
@@ -214,6 +218,7 @@ PROP_HANDLER(PROP_DISPSENSOR_CTRL)
 
 volatile int video_mode_crop = 0;
 volatile int video_mode_fps = 0;
+volatile int video_mode_fps_x100 = 0;   /* DIGIC 6+: exact value from PROP_VIDEO_MODE, e.g. 2398 */
 volatile int video_mode_resolution = 0; // 0 if full hd, 1 if 720p, 2 if 480p
 PROP_HANDLER(PROP_VIDEO_MODE)
 {
@@ -227,6 +232,7 @@ PROP_HANDLER(PROP_VIDEO_MODE)
     // Old code assumes 2 digits only, e.g. flip_zoom_twostage()
     // Add 50 to round up, so e.g. 29.97 gets reported as 30.
     video_mode_fps = (buf[2] + 50) / 100;
+    video_mode_fps_x100 = buf[2];
     #else
     video_mode_crop = buf[0];
     video_mode_resolution = buf[1];

@@ -166,13 +166,255 @@ static CONFIG_INT("raw.h264.proxy", h264_proxy_menu, 0);
 static CONFIG_INT("raw.sync_beep", sync_beep, 1);
 
 static CONFIG_INT("raw.output_format", output_format, 3);
+
+/* record from photo-mode LiveView too (M50: Open Gate 3:2 = full sensor, 2096x838) */
+static CONFIG_INT("raw.photo.lv", allow_photo_lv, 0);
+#define RAW_LV_MODE_OK (is_movie_mode() || (allow_photo_lv && lv))
+/* photo mode LV: Canon needs its shoot memory there (playback, captures),
+ * so only hold it while recording (M50 Open Gate hang, 2026-11-03) */
+#define PHOTO_LV_LAZY_ALLOC (!is_movie_mode())
+static volatile int photo_lv_alloc = 0;
+
+/* photo mode LV runs at 59.94 fps on M50 (timer A 0x2d1, B 0x26f, 27 MHz TG).
+ * Canon rewrites timer B every frame there, so we rewrite it after Canon on every
+ * frame with the movie 23.976p value (0x617, rawdump FPS24 test: 24.0 fps).
+ * Two signs: ROM per-mode tables + camera reads of B at 24/30/60p. */
+#define M50_FPS_CONFIRM 0xD0406190
+#define M50_FPS_TIMER_A 0xD0406198
+#define M50_FPS_TIMER_B 0xD04061A4
+#define M50_PHOTO_LV_TIMER_A 0x2d1
+#define M50_TIMER_B_23976 0x617
+#define M50_TIMER_B_29970 0x4df
+
+/* 0 = 23.976p, 1 = 29.97p, 2 = off (Canon 59.94, every 2nd frame recorded) */
+static CONFIG_INT("raw.photo.lv.fps", photo_lv_fps, 0);
+
+static volatile int timer_a_changes = 0;
+static volatile uint32_t last_timer_a = 0;
+
+static int photo_lv_24p()
+{
+    return PHOTO_LV_LAZY_ALLOC && allow_photo_lv && raw_video_enabled && lv && photo_lv_fps < 2 &&
+           *(volatile uint32_t *) M50_FPS_TIMER_A == M50_PHOTO_LV_TIMER_A;
+}
+
+/* Timer B alone left Canon's exposure kicks at 60p (dark band at the bottom at low ISO).
+ * Also give Canon the movie-mode frame length and the ESync BaseVD kick pattern
+ * (rawdump FPS24 run 4, ISO 100: no band). Values = Canon's own movie 24p / 30p:
+ * m_VSize 0xef34, VSize-38 0xef40, VD 0xa3594, VD-38 0xa359c (FPSRAM),
+ * ESync rate 0x17730 (FPSRAM2; read on every kick by FUN_e081b248). */
+#define M50_RAM_VSIZE      (0xef24 + 0x10)
+#define M50_RAM_VSIZE_MAX  (0xef24 + 0x1c)
+#define M50_RAM_VD         (0xa3594)
+#define M50_RAM_VD_MAX     (0xa3594 + 8)
+#define M50_RAM_ESYNC_RATE (0x1770c + 0x24)
+#define M50_PHOTO_LV_VSIZE 0x270
+
+/* experimental, default OFF: with it the band got bigger (vdfix_rec2: edge row ~560 at
+ * AC 292 vs ~722 with timer B only) -> edge ~ 560 + 2 * (1268 - (VD - AC)) rows */
+static CONFIG_INT("raw.photo.lv.vdfix", photo_lv_vdfix, 0);
+
+static const uint32_t photo_lv_vsize[2] = { 0x618, 0x4e0 };    /* 23.976, 29.97 */
+static const uint32_t photo_lv_rate[2]  = { 2, 1 };
+static int photo_lv_fix_applied = 0;
+static uint32_t photo_lv_orig[5];
+
+/* Shutter in photo LV 24p: AC = exposure in sensor lines of 26.74 us (0x123c8+0x7c = 2674).
+ * Movie mode, Canon 1/50: AC = 747 lines = 19.97 ms (FPSRAM2) -> AC is the exposure.
+ * Canon's photo-LV AE picks short AC at low ISO (112 = 1/334 at ISO 100), which starts the
+ * exposure late in a 24p frame -> dark band. Forcing a film shutter keeps the start early.
+ * Copies: 0xef24+0x20 (u32) and u16 at 0xa3594+0xe, both read back as AC. */
+#define M50_RAM_AC         (0xef24 + 0x20)
+#define M50_RAM_VD_AC_U16  (0xa3594 + 0xe)
+#define M50_US_PER_LINE_X100 2674
+#define M50_FRAMEDATA_PTR  (0x7180 + 0x40)
+
+/* Shutter angle (Shosho shoots 24p at 180 deg): exposure = angle / 360 of the frame,
+ * and the frame is VSize lines long -> AC = VSize * angle / 360 (180 deg @ 24p = 780 lines
+ * = 1/48 s). Index 0 = Canon (auto). Edge model: start = VD - AC <= ~1180 lines has no
+ * band, i.e. angle >= ~90 deg @ 24p. VSize - 38 is Canon's max AC (~351 deg). */
+/* angle180_1: AC 780 was written but Canon's SetTgParam (FUN_e00da8b4) rewrites AC from
+ * FrameData before the exposure is scheduled -> no effect (brightness unchanged, band
+ * edge ~640). Default back to Canon (auto) until AC is set at SetTgParam's input. */
+static CONFIG_INT("raw.photo.lv.angle2", photo_lv_shutter, 0);
+static const int photo_lv_angle_x10[] = { 0, 450, 900, 1200, 1440, 1728, 1800, 2160, 2700, 3450 };
+
+static int photo_lv_shutter_lines()
+{
+    if (!photo_lv_shutter) return 0;
+    int angle_x10 = photo_lv_angle_x10[COERCE(photo_lv_shutter, 0, COUNT(photo_lv_angle_x10) - 1)];
+    int vsize = photo_lv_vsize[photo_lv_fps ? 1 : 0];
+    int lines = (vsize * angle_x10 + 1800) / 3600;
+    return COERCE(lines, 1, vsize - 38);
+}
+
+/* EXPERIMENT (FRAMEDAT shutter/aperture/ISO sweeps, photo LV 60p): FrameData fd[3] tracks
+ * the exposure setting (+0x300 per stop of Tv/Av, -0x300 per stop of ISO) and fd[0] is its
+ * complement (fd[0] + fd[3] = 0x1ec0); fd[4] (AC) stays 378. The dark band grows exactly when
+ * fd[0] is small (ISO 100: 0xf00, f/11: 0x10e0; bright f/5.6 ISO 800: 0x16e0 = small band).
+ * Hypothesis: fd[0] = the exposure Canon really applies in LV. Force it to fixed codes,
+ * 0x300 apart, and compare RAW brightness + band per code. OFF = Canon's value. */
+static CONFIG_INT("raw.photo.lv.expcode", photo_lv_expcode, 0);
+static const uint16_t photo_lv_expcodes[] = { 0, 0x1b00, 0x1800, 0x1500, 0x1200, 0x0f00 };
+
+static void photo_lv_expcode_step()
+{
+    if (!photo_lv_expcode) return;
+    uint32_t fd = *(volatile uint32_t *) M50_FRAMEDATA_PTR;
+    if (fd < 0x1000 || fd >= 0x40000000 || (fd & 1)) return;
+    int i = COERCE(photo_lv_expcode, 0, COUNT(photo_lv_expcodes) - 1);
+    ((volatile uint16_t *) fd)[0] = photo_lv_expcodes[i];
+}
+
+/* ROOT FIX (VDPATCH run, raw_tests/vdpatch1): Canon computes the photo-LV frame length every
+ * frame from its VD table, VD = u16 table[*(0x123c8+0x5c) + mode*0x1a + rate*2] (FUN_e00da408),
+ * photo LV = mode 1, rate 0 -> 0x26f. The photo row has no 24p column; the movie row's 24p
+ * value is 0x617 (= our timer B). With the photo 60p entry patched to 0x617, Canon itself
+ * programmed timer B 0x617, VD/m_VSize 0x618, sensor CMOS 0x50 = 0x618 and
+ * 0x29 = 1560 - AC + 9 (follows AE), RAW exposure correct, no band. 29.97 uses Canon's own
+ * photo 30p value 0x4df. Restored when our 24p turns off. */
+#define M50_VD_TABLE_PTR   (0x123c8 + 0x5c)
+#define M50_VD_SEQ_MODE    (0x123c8 + 0xc)
+#define M50_VD_SEQ_RATE    (0x123c8 + 2)
+#define M50_VD_PHOTO_60P   0x26f
+static volatile uint16_t *photo_lv_tab_entry = 0;
+
+static void photo_lv_table_step()
+{
+    if (photo_lv_24p())
+    {
+        if (!photo_lv_tab_entry)
+        {
+            uint32_t tab = *(volatile uint32_t *) M50_VD_TABLE_PTR;
+            if (tab > 0x1000 && tab < 0x60000000 && !(tab & 1) &&
+                *(volatile uint32_t *) M50_VD_SEQ_MODE == 1 && *(volatile uint16_t *) M50_VD_SEQ_RATE == 0)
+            {
+                volatile uint16_t *e = (volatile uint16_t *) (tab + 1 * 0x1a);
+                if (*e == M50_VD_PHOTO_60P)
+                    photo_lv_tab_entry = e;
+            }
+        }
+        if (photo_lv_tab_entry)
+            *photo_lv_tab_entry = photo_lv_fps ? M50_TIMER_B_29970 : M50_TIMER_B_23976;
+    }
+    else if (photo_lv_tab_entry)
+    {
+        /* photo row only, harmless to restore in any mode */
+        *photo_lv_tab_entry = M50_VD_PHOTO_60P;
+        photo_lv_tab_entry = 0;
+    }
+}
+
+/* shutter angle: with the table fix the sensor follows Canon's AC (FrameData[4] -> SetTgParam
+ * -> VD struct -> m_ShutterSpeed -> CMOS 0x29), so set it at FrameData */
+static void photo_lv_angle_step()
+{
+    int ac = photo_lv_shutter_lines();
+    if (!ac) return;
+    uint32_t fd = *(volatile uint32_t *) M50_FRAMEDATA_PTR;
+    if (fd >= 0x1000 && fd < 0x60000000 && !(fd & 1))
+        ((volatile uint16_t *) fd)[4] = ac;
+}
+
+static void photo_lv_24p_step()
+{
+    photo_lv_table_step();
+
+    if (!photo_lv_24p() || !photo_lv_vdfix)
+    {
+        if (photo_lv_fix_applied)
+        {
+            /* our setting turned off, Canon still in the same photo LV mode: put its values back */
+            if (!is_movie_mode() && *(volatile uint32_t *) M50_FPS_TIMER_A == M50_PHOTO_LV_TIMER_A)
+            {
+                *(volatile uint32_t *) M50_RAM_VSIZE = photo_lv_orig[0];
+                *(volatile uint32_t *) M50_RAM_VSIZE_MAX = photo_lv_orig[1];
+                *(volatile uint32_t *) M50_RAM_VD = photo_lv_orig[2];
+                *(volatile uint32_t *) M50_RAM_VD_MAX = photo_lv_orig[3];
+                *(volatile uint32_t *) M50_RAM_ESYNC_RATE = photo_lv_orig[4];
+                *(volatile uint32_t *) M50_FPS_TIMER_B = M50_PHOTO_LV_VSIZE - 1;
+                *(volatile uint32_t *) M50_FPS_CONFIRM = 1;
+            }
+            photo_lv_fix_applied = 0;
+        }
+        if (photo_lv_24p())
+        {
+            /* timer B (Canon writes the same value itself with the table fix) */
+            *(volatile uint32_t *) M50_FPS_TIMER_B = photo_lv_fps ? M50_TIMER_B_29970 : M50_TIMER_B_23976;
+            *(volatile uint32_t *) M50_FPS_CONFIRM = 1;
+            photo_lv_angle_step();
+            photo_lv_expcode_step();
+        }
+        return;
+    }
+
+    int i = photo_lv_fps ? 1 : 0;
+
+    /* Canon flickers VSize/VD by 1 (0x26f / 0x270, FPS24 run 4b) */
+    uint32_t vsize = *(volatile uint32_t *) M50_RAM_VSIZE;
+    if (!photo_lv_fix_applied &&
+        (vsize == M50_PHOTO_LV_VSIZE || vsize == M50_PHOTO_LV_VSIZE - 1) &&
+        *(volatile uint32_t *) M50_RAM_ESYNC_RATE == 0)
+    {
+        photo_lv_orig[0] = *(volatile uint32_t *) M50_RAM_VSIZE;
+        photo_lv_orig[1] = *(volatile uint32_t *) M50_RAM_VSIZE_MAX;
+        photo_lv_orig[2] = *(volatile uint32_t *) M50_RAM_VD;
+        photo_lv_orig[3] = *(volatile uint32_t *) M50_RAM_VD_MAX;
+        photo_lv_orig[4] = *(volatile uint32_t *) M50_RAM_ESYNC_RATE;
+        photo_lv_fix_applied = 1;
+    }
+
+    *(volatile uint32_t *) M50_FPS_TIMER_B = photo_lv_fps ? M50_TIMER_B_29970 : M50_TIMER_B_23976;
+    *(volatile uint32_t *) M50_FPS_CONFIRM = 1;
+
+    if (photo_lv_fix_applied)
+    {
+        *(volatile uint32_t *) M50_RAM_VSIZE = photo_lv_vsize[i];
+        *(volatile uint32_t *) M50_RAM_VSIZE_MAX = photo_lv_vsize[i] - 38;
+        *(volatile uint32_t *) M50_RAM_VD = photo_lv_vsize[i];
+        *(volatile uint32_t *) M50_RAM_VD_MAX = photo_lv_vsize[i] - 38;
+        *(volatile uint32_t *) M50_RAM_ESYNC_RATE = photo_lv_rate[i];
+
+        int ac = photo_lv_shutter_lines();
+        if (ac)
+        {
+            *(volatile uint32_t *) M50_RAM_AC = ac;
+            *(volatile uint16_t *) M50_RAM_VD_AC_U16 = ac;
+
+            /* the copy Canon actually uses: FrameData[4] ("Acc"), read by
+             * evfSetParamInterrupt -> SetTgParam at the start of the next frame.
+             * FRAMEDAT.TXT: FrameData = *(0x7180+0x40) = 0x9c4440 in movie and photo LV,
+             * fd[4] == AC used (747 / 292 / 378); our hooks run ~38 ms before it is read. */
+            uint32_t fd = *(volatile uint32_t *) M50_FRAMEDATA_PTR;
+            if (fd >= 0x1000 && fd < 0x40000000 && (fd & 1) == 0)
+            {
+                ((volatile uint16_t *) fd)[4] = ac;
+            }
+        }
+    }
+}
+
+/* fallback if the timer override is not active: record every 2nd frame (29.97p) */
+static int rec_frame_skip()
+{
+    if (photo_lv_24p()) return 1;
+    return (PHOTO_LV_LAZY_ALLOC && fps_get_current_x1000() > 45000) ? 2 : 1;
+}
+
+static int rec_fps_x1000()
+{
+    if (photo_lv_24p()) return photo_lv_fps ? 29970 : 23976;
+    return fps_get_current_x1000() / rec_frame_skip();
+}
 #define OUTPUT_14BIT_NATIVE 0
 #define OUTPUT_12BIT_UNCOMPRESSED 1
 #define OUTPUT_10BIT_UNCOMPRESSED 2
 #define OUTPUT_14BIT_LOSSLESS 3
 #define OUTPUT_12BIT_LOSSLESS 4
 #define OUTPUT_AUTO_BIT_LOSSLESS 5
-#define OUTPUT_COMPRESSION (output_format>2)
+#define OUTPUT_COMPRESSION_REQUESTED (output_format>2)
+static int lossless_ok = 0;     /* lossless_init() result; M50 has no lossless path yet */
+#define OUTPUT_COMPRESSION (OUTPUT_COMPRESSION_REQUESTED && lossless_ok && lossless_ready())
 
 /* container BPP (variable for uncompressed, always 14 for lossless JPEG) */
 static const int bpp_container[] = { 14, 12, 10, 14, 14, 14, 14, 14, 14 };
@@ -180,7 +422,15 @@ static const int bpp_container[] = { 14, 12, 10, 14, 14, 14, 14, 14, 14 };
 /* "fake" lower bit depths using digital gain (for lossless JPEG) */
 //static const int bpp_digi_gain[] = { 14, 14, 14, 14, 12, 11, 10,  9,  8 };
 
-#define BPP     bpp_container[output_format]
+extern void edmac_copy_set_output_bpp(int bpp);
+extern int edmac_copy_output_bpp_supported();
+
+/* M50: Canon's LV RAW stays 14-bit, the EDMAC copy converts to 10/12-bit */
+#define BPP_BY_EDMAC (!raw_lv_bpp_change_supported() && edmac_copy_output_bpp_supported())
+#define BPP     ((raw_lv_bpp_change_supported() || BPP_BY_EDMAC) && !(OUTPUT_COMPRESSION_REQUESTED && !lossless_ok) \
+                 ? bpp_container[output_format] : 14)
+/* bit depth of the buffer we copy from (14 when the EDMAC converts) */
+#define BPP_SRC (BPP_BY_EDMAC ? 14 : BPP)
 #define BPP_D   (raw_digital_gain_ok() ? bpp_digital_gain() : 14)
 
 static int bpp_digital_gain()
@@ -239,6 +489,9 @@ static int bpp_digital_gain()
 
 static int raw_digital_gain_ok()
 {
+    /* M50: index 4 is "13-bit compact" (CRX rounded field), never the DIGIC 5 digital-gain trick */
+    if (is_camera("M50", "*")) return 0;
+
     if (output_format > OUTPUT_14BIT_LOSSLESS)
     {
         /* fixme: not working in modes with higher resolution */
@@ -308,6 +561,7 @@ static volatile int raw_recording_state = RAW_IDLE;
 #define RAW_IS_FINISHING (raw_recording_state == RAW_FINISHING)
 
 #define VIDF_HDR_SIZE 64
+#define CRX_MAX_WRITE_GROUP 6     /* frames per FIO write in lossless mode (about 9 MB) */
 
 /* one video frame */
 struct frame_slot
@@ -359,6 +613,7 @@ static GUARDED_BY(RawRecTask)   int64_t written_chunk[CARD_COUNT] = {0};        
 static GUARDED_BY(RawRecTask)   int writing_time[CARD_COUNT] = {0};               /* time spent by raw_video_rec_task in FIO_WriteFile calls */
 static GUARDED_BY(RawRecTask)   int idle_time[CARD_COUNT] = {0};                  /* time spent by raw_video_rec_task doing something else */
 static volatile                 uint32_t edmac_active = 0;
+static volatile                 int realloc_after_recording = 0;
 static volatile                 uint32_t skip_frames = 0;
 
 /* for compress_task */
@@ -832,7 +1087,7 @@ static int get_estimated_compression_ratio()
 
 static int predict_frames(int write_speed, int available_slots)
 {
-    int fps = fps_get_current_x1000();
+    int fps = rec_fps_x1000();
     if (fps == 0)
         return INT_MAX;
 
@@ -883,7 +1138,7 @@ static char* guess_how_many_frames()
 
 static MENU_UPDATE_FUNC(write_speed_update)
 {
-    int fps = fps_get_current_x1000();
+    int fps = rec_fps_x1000();
 
     int speed = (res_x * res_y * BPP/8 / 1024) * fps / 1024
         * get_estimated_compression_ratio() / 100 / 10;
@@ -948,6 +1203,7 @@ static REQUIRES(settings_sem)
 void setup_bit_depth()
 {
     raw_lv_request_bpp(BPP);
+    edmac_copy_set_output_bpp(BPP_BY_EDMAC ? BPP : 14);
     setup_bit_depth_digital_gain(0);
 }
 
@@ -956,6 +1212,7 @@ static REQUIRES(settings_sem)
 void restore_bit_depth()
 {
     raw_lv_request_bpp(14);
+    edmac_copy_set_output_bpp(14);
     setup_bit_depth_digital_gain(1);
 }
 
@@ -1107,7 +1364,7 @@ static MENU_UPDATE_FUNC(resolution_update)
     {
         // We don't know how to do EDMAC rect copies yet on this cam.
         // We use a fast memcpy variant, but are limited to full width copies.
-        selected_x = raw_info.pitch * 8 / BPP;
+        selected_x = raw_info.pitch * 8 / BPP_SRC;
     }
     
     if (selected_x > max_res_x)
@@ -1198,6 +1455,23 @@ static MENU_UPDATE_FUNC(output_format_update)
 {
     refresh_raw_settings(0);
 
+    if (OUTPUT_COMPRESSION_REQUESTED && !lossless_ok)
+    {
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Lossless not available on this camera yet: records 14-bit uncompressed.");
+    }
+    else if (OUTPUT_COMPRESSION_REQUESTED && !lossless_ready())
+    {
+        /* M50: try once per change to get the 5 MB encoder buffer */
+        static int tried_format = -1;
+        if (tried_format != output_format && RAW_IS_IDLE) { tried_format = output_format; lossless_m50_prealloc(); }
+        if (!lossless_ready())
+            MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Lossless needs 5 MB: restart the camera with this setting (records 14-bit now).");
+    }
+    else if (!raw_lv_bpp_change_supported() && !BPP_BY_EDMAC && output_format != OUTPUT_14BIT_NATIVE)
+    {
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "This camera records 14-bit only for now.");
+    }
+
     switch (output_format)
     {
         case OUTPUT_14BIT_NATIVE:
@@ -1213,7 +1487,17 @@ static MENU_UPDATE_FUNC(output_format_update)
             break;
     }
 
-    if (output_format > OUTPUT_14BIT_LOSSLESS)
+    if (output_format == OUTPUT_12BIT_LOSSLESS && is_camera("M50", "*"))
+    {
+        MENU_SET_VALUE("12-bit lossless");
+        MENU_SET_HELP("M50: exact 12-bit data (2 lowest bits dropped by the EDMAC), CRX lossless.");
+    }
+    else if (output_format == OUTPUT_AUTO_BIT_LOSSLESS && is_camera("M50", "*"))
+    {
+        MENU_SET_VALUE("10-bit lossless");
+        MENU_SET_HELP("M50: 12-bit data with CRX rounding (error <= 2 at 12-bit = 10-bit precision).");
+    }
+    else if (output_format > OUTPUT_14BIT_LOSSLESS)
     {
         MENU_SET_VALUE("%d-bit lossless", BPP_D);
 
@@ -1256,7 +1540,7 @@ static int pre_record_calc_max_frames(int slot_count)
 static int pre_record_calc_num_frames(int slot_count, int max_frames)
 {
     int requested_seconds = pre_record;
-    int requested_frames = (requested_seconds * fps_get_current_x1000() + 500) / 1000;
+    int requested_frames = (requested_seconds * rec_fps_x1000() + 500) / 1000;
     return COERCE(requested_frames, 1, max_frames);
 }
 
@@ -1281,7 +1565,7 @@ static MENU_UPDATE_FUNC(pre_recording_update)
         int pre_frames = pre_record_calc_num_frames(slot_count, max_frames);
         if (pre_frames == max_frames)
         {
-            int fps = fps_get_current_x1000();
+            int fps = rec_fps_x1000();
             if (fps != 0)
             {
                 int total_sec = (slot_count * 1000 * 10 + fps/2) / fps;
@@ -1407,6 +1691,54 @@ void add_reserved_slots(void * ptr, int n)
     }
 }
 
+/* one contiguous block of memory -> frame slots */
+static REQUIRES(settings_sem)
+void add_mem_region(intptr_t ptr, int size, int max_frame_size)
+{
+    /* align pointer at 64 bytes */
+    intptr_t ptr_raw = ptr;
+    ptr   = (ptr + 63) & ~63;
+    size -= (ptr - ptr_raw);
+
+    /* fit as many frames as we can */
+    int group_size = 0;
+    while (size >= max_frame_size && total_slot_count < COUNT(slots))
+    {
+        slots[total_slot_count].ptr = (void*) ptr;
+        slots[total_slot_count].status = SLOT_FREE;
+        slots[total_slot_count].size = max_frame_size;
+
+        /* fixme: duplicate code (shrink_slot, frame_size_uncompressed etc) */
+        slots[total_slot_count].payload_size = 
+            (OUTPUT_COMPRESSION) ? max_frame_size - VIDF_HDR_SIZE - 4
+                                 : frame_size_uncompressed ;
+        int checked_size = (slots[total_slot_count].payload_size + VIDF_HDR_SIZE + 4 + 511) & ~511;
+        ASSERT(checked_size == slots[total_slot_count].size);
+
+        ptr += max_frame_size;
+        size -= max_frame_size;
+        group_size += max_frame_size;
+        total_slot_count++;
+        valid_slot_count++;
+        //printf("slot #%d: %x\n", total_slot_count, ptr);
+
+        /* split the group at 32M-512K */
+        /* (after this number, write speed decreases) */
+        /* (CFDMA can write up to FFFF sectors at once) */
+        /* (FFFE just in case) */
+        if (group_size + max_frame_size > 0xFFFE * 512)
+        {
+            /* insert a small gap to split the group here */
+            add_reserved_slots((void*)ptr, group_size / max_frame_size);
+            ptr += 64;
+            size -= 64;
+            group_size = 0;
+        }
+    }
+    
+    add_reserved_slots((void*)ptr, group_size / max_frame_size);
+}
+
 static REQUIRES(settings_sem)
 int add_mem_suite(struct memSuite * mem_suite, int chunk_index, int max_frame_size, int fullres_buf_size)
 {
@@ -1427,48 +1759,7 @@ int add_mem_suite(struct memSuite * mem_suite, int chunk_index, int max_frame_si
                 printf("%x: %s after full-res buffer.\n", ptr, format_memory_size(size));
             }
 
-            /* align pointer at 64 bytes */
-            intptr_t ptr_raw = ptr;
-            ptr   = (ptr + 63) & ~63;
-            size -= (ptr - ptr_raw);
-
-            /* fit as many frames as we can */
-            int group_size = 0;
-            while (size >= max_frame_size && total_slot_count < COUNT(slots))
-            {
-                slots[total_slot_count].ptr = (void*) ptr;
-                slots[total_slot_count].status = SLOT_FREE;
-                slots[total_slot_count].size = max_frame_size;
-
-                /* fixme: duplicate code (shrink_slot, frame_size_uncompressed etc) */
-                slots[total_slot_count].payload_size = 
-                    (OUTPUT_COMPRESSION) ? max_frame_size - VIDF_HDR_SIZE - 4
-                                         : frame_size_uncompressed ;
-                int checked_size = (slots[total_slot_count].payload_size + VIDF_HDR_SIZE + 4 + 511) & ~511;
-                ASSERT(checked_size == slots[total_slot_count].size);
-
-                ptr += max_frame_size;
-                size -= max_frame_size;
-                group_size += max_frame_size;
-                total_slot_count++;
-                valid_slot_count++;
-                //printf("slot #%d: %x\n", total_slot_count, ptr);
-
-                /* split the group at 32M-512K */
-                /* (after this number, write speed decreases) */
-                /* (CFDMA can write up to FFFF sectors at once) */
-                /* (FFFE just in case) */
-                if (group_size + max_frame_size > 0xFFFE * 512)
-                {
-                    /* insert a small gap to split the group here */
-                    add_reserved_slots((void*)ptr, group_size / max_frame_size);
-                    ptr += 64;
-                    size -= 64;
-                    group_size = 0;
-                }
-            }
-            
-            add_reserved_slots((void*)ptr, group_size / max_frame_size);
+            add_mem_region(ptr, size, max_frame_size);
 
             /* next chunk */
             chunk = GetNextMemoryChunk(mem_suite, chunk);
@@ -1546,7 +1837,7 @@ int setup_buffers()
      * depending on how the EDMAC size was interpreted back then
      * todo: double-check (for now, allocate a bit more, just in case)
      */
-    int fullres_buf_size = raw_info.width * (raw_info.height + 2) * BPP/8;
+    int fullres_buf_size = raw_info.width * (raw_info.height + 2) * BPP_SRC/8;
 
     int pre_recording_settings = pre_record | (rec_trigger << 8);
 
@@ -1579,6 +1870,13 @@ int setup_buffers()
     {
         /* large buffers? assume single-buffering is safe for uncompressed output */
         printf("Using single buffering (check with Show EDMAC).\n");
+        fullsize_buffers[0] = UNCACHEABLE(raw_info.buffer);
+    }
+
+    if (!fullsize_buffers[0] && !raw_lv_redirect_supported())
+    {
+        /* LV RAW output can't be redirected here (M50): both buffers must be Canon's */
+        printf("No LV RAW redirect: single buffering.\n");
         fullsize_buffers[0] = UNCACHEABLE(raw_info.buffer);
     }
 
@@ -1616,6 +1914,36 @@ int setup_buffers()
     chunk_index = add_mem_suite(shoot_mem_suite, chunk_index, max_frame_size, fullres_buf_size);
     printf("%d slots from shoot_malloc.\n", valid_slot_count);
     chunk_index = add_mem_suite(srm_mem_suite, chunk_index, max_frame_size, fullres_buf_size);
+
+    /* M50 photo LV, lossless: ALGSMGR's two unused output rings hold more frames, so a longer card
+     * pause does not stop the take (raw_tests/crxrec8, 9, 11). */
+    if (OUTPUT_COMPRESSION && PHOTO_LV_LAZY_ALLOC && shoot_mem_suite)
+    {
+        uint32_t ex_addr[2]; int ex_size[2];
+        int ex_n = lossless_m50_extra_regions(res_x, res_y, ex_addr, ex_size);
+        int ex_slots = valid_slot_count;
+        for (int r = 0; r < ex_n; r++)
+        {
+            int overlap = 0;
+            struct memChunk * chunk = GetFirstChunkFromSuite(shoot_mem_suite);
+            while (chunk)
+            {
+                uint32_t c0 = (uint32_t) GetMemoryAddressOfMemoryChunk(chunk) & 0x3FFFFFFF;
+                uint32_t c1 = c0 + GetSizeOfMemoryChunk(chunk);
+                uint32_t e0 = ex_addr[r] & 0x3FFFFFFF;
+                uint32_t e1 = e0 + ex_size[r];
+                if (c0 < e1 && e0 < c1) overlap = 1;
+                chunk = GetNextMemoryChunk(shoot_mem_suite, chunk);
+            }
+            if (overlap)
+            {
+                printf("CRX extra buffer %x overlaps the shoot memory, not used.\n", ex_addr[r]);
+                continue;
+            }
+            add_mem_region((intptr_t) ex_addr[r], ex_size[r], max_frame_size);
+        }
+        printf("%d extra slots from the encoder buffers.\n", valid_slot_count - ex_slots);
+    }
 
     if (0)
     {
@@ -1783,7 +2111,7 @@ void raw_lv_request_update()
 {
     static int raw_lv_requested = 0;
 
-    if (raw_video_enabled && lv && is_movie_mode())
+    if (raw_video_enabled && lv && RAW_LV_MODE_OK)
     {
         if (!raw_lv_requested)
         {
@@ -1805,7 +2133,7 @@ void raw_lv_request_update()
 static int update_status(char * buffer, int buffer_size)
 {
     /* Calculate the stats */
-    int fps = fps_get_current_x1000();  /* FPS x1000 */
+    int fps = rec_fps_x1000();  /* FPS x1000 */
     int p = pre_recorded_frames();      /* pre-recorded frames */
 
     if (fps == 0)
@@ -2024,12 +2352,19 @@ unsigned int raw_rec_polling_cbr(unsigned int unused)
     raw_lv_request_update();
 
     /* auto-disable raw video in photo mode or outside LiveView */
-    int raw_video_active = raw_video_enabled && lv && is_movie_mode();
+    int raw_video_active = raw_video_enabled && lv && RAW_LV_MODE_OK;
 
     /* when Canon state changes, their memory layout may change too
      * reallocate the memory when this happens */
     static int prev_state = -1;
     static int realloc = 0;
+
+    /* buffers were freed at the end of a recording: get them back */
+    if (realloc_after_recording)
+    {
+        realloc_after_recording = 0;
+        realloc = 1;
+    }
     int current_state =
         (raw_video_active   ? 1 : 0) |      /* force realloc when re-enabling */
         (RECORDING_H264     ? 2 : 0) ;      /* this one can be tricky */
@@ -2051,7 +2386,13 @@ unsigned int raw_rec_polling_cbr(unsigned int unused)
 
     /* caveat: we may get out of LiveView before recording fully stops
      * don't free the resources if the raw video task is still active */
-    if (!raw_video_active && RAW_IS_IDLE)
+    /* photo mode LV: memory is requested by the rec task only */
+    if (PHOTO_LV_LAZY_ALLOC && photo_lv_alloc && !shoot_mem_suite && !srm_mem_suite)
+    {
+        realloc = 1;
+    }
+
+    if ((!raw_video_active || (PHOTO_LV_LAZY_ALLOC && !photo_lv_alloc)) && RAW_IS_IDLE)
     {
         /* raw video turned off? free any resources we might have got */
         if (shoot_mem_suite || srm_mem_suite)
@@ -2669,7 +3010,7 @@ static void edmac_start_spy()
     /* write to raw buffer is always done on raw_write_chan (EDMAC_RAW_SLURP) */
     edmac_read_base = edmac_get_base(OUTPUT_COMPRESSION ? 8 : edmac_read_chan);
     edmac_wraw_base = edmac_get_base(raw_write_chan);
-    int fps = fps_get_current_x1000();
+    int fps = rec_fps_x1000();
     if (fps == 0)
         return;
 
@@ -2723,6 +3064,14 @@ static void compress_task()
                 edmac_memcpy_res_lock();
                 printf("EDMAC copy resources locked.\n");
             }
+            else
+            {
+                /* M50: the CRX backend locks ch61/24 itself and sets up encoder Id 1 */
+                lossless_m50_round_field = 1;
+                lossless_m50_mode = (output_format == OUTPUT_12BIT_LOSSLESS) ? 1 : (output_format == OUTPUT_AUTO_BIT_LOSSLESS) ? 2 : 0;
+                printf("CRX mode %d (%s)\n", lossless_m50_mode, lossless_m50_mode == 1 ? "12-bit lossless" : lossless_m50_mode == 2 ? "10-bit" : "14-bit lossless");
+                lossless_rec_start();
+            }
 
             edmac_start_spy();
 
@@ -2738,6 +3087,10 @@ static void compress_task()
                 /* exclusive edmac access no longer needed */
                 edmac_memcpy_res_unlock();
                 printf("EDMAC copy resources unlocked.\n");
+            }
+            else
+            {
+                lossless_rec_stop();
             }
 
             edmac_stop_spy();
@@ -2777,10 +3130,17 @@ static void compress_task()
             /* only report compression errors while recording
              * some of them appear during video mode switches
              * unlikely to cause actual trouble - silence them for now */
-            if (compressed_size < 0 && !RAW_IS_IDLE)
+            if (compressed_size < 0)
             {
-                printf("Compression error %d at frame %d\n", compressed_size, frame_count-1);
-                ASSERT(0);
+                /* M50 CRX: stop the take cleanly instead of writing a bad frame size */
+                if (!RAW_IS_IDLE)
+                {
+                    printf("Compression error %d at frame %d\n", compressed_size, frame_count-1);
+                    buffer_full = 1;
+                }
+                memset(out_ptr, 0, 64);
+                memcpy(out_ptr, "CRXERR", 6);
+                compressed_size = 64;
             }
 
             DeleteMemorySuite(outSuite);
@@ -2816,15 +3176,22 @@ static void compress_task()
             {
                 measured_compression_ratio = (compressed_size/128) * 100 / (frame_size_uncompressed/128);
             }
+
+            /* M50 CRX timing, every 48 frames: EDMAC 14->16, encode, chunk copy, total (us) */
+            if (is_camera("M50", "*") && !RAW_IS_IDLE && (frame_count <= 4 || (frame_count % 48) == 1 || lossless_m50_last_us[3] > 40000))
+            {
+                printf("CRX t%d f%d %dB (%d%%) %d/%d/%d us\n", get_ms_clock(), frame_count - 1, compressed_size, measured_compression_ratio,
+                       lossless_m50_last_us[0], lossless_m50_last_us[1], lossless_m50_last_us[2]);
+            }
         }
         else
         {
             edmac_active = 1;
             edmac_copy_rectangle_cbr_start(
                 (void*)out_ptr, fullSizeBuffer,
-                raw_info.pitch, (skip_x + 7)/8*BPP, skip_y/2*2,
+                raw_info.pitch, (skip_x + 7)/8*BPP_SRC, skip_y/2*2,
                 res_x * BPP/8, 0, 0,
-                res_x * BPP/8, res_y,
+                res_x * BPP_SRC/8, res_y,
                 &edmac_cbr_r, &edmac_cbr_w, NULL
             );
         }
@@ -2840,6 +3207,7 @@ void process_frame(int next_fullsize_buffer_pos)
     /* skip the first frame(s) */
     if (frame_count <= 0)
     {
+        printf("vsync: first frame callback\n");
         frame_count++;
         return;
     }
@@ -2860,6 +3228,7 @@ void process_frame(int next_fullsize_buffer_pos)
     if (edmac_active)
     {
         /* EDMAC too slow */
+        printf("vsync: EDMAC still busy at frame %d, stopping.\n", frame_count);
         NotifyBox(2000, "EDMAC timeout.");
         buffer_full = 1;
         return;
@@ -2906,6 +3275,10 @@ void process_frame(int next_fullsize_buffer_pos)
     else
     {
         /* card too slow */
+        if (OUTPUT_COMPRESSION)
+        {
+            printf("CRX buffer full at frame %d\n", frame_count);
+        }
         buffer_full = 1;
         return;
     }
@@ -2938,7 +3311,9 @@ unsigned int FAST raw_rec_vsync_cbr(unsigned int unused)
 {
     if (!raw_video_enabled) return 0;
     if (!compress_mq) return 0;
-    if (!is_movie_mode()) return 0;
+    if (!RAW_LV_MODE_OK) return 0;
+
+    photo_lv_24p_step();
 
     hack_liveview_vsync();
  
@@ -2946,8 +3321,30 @@ unsigned int FAST raw_rec_vsync_cbr(unsigned int unused)
     panning_update();
 
     if (!RAW_IS_RECORDING) return 0;
-    if (!raw_lv_settings_still_valid()) { raw_recording_state = RAW_FINISHING; return 0; }
+
+    /* M50 AF test: report sensor timer changes while recording in photo LV */
+    if (PHOTO_LV_LAZY_ALLOC)
+    {
+        static uint32_t prev_a = 0;
+        uint32_t a = *(volatile uint32_t *) M50_FPS_TIMER_A;
+        if (a != prev_a)
+        {
+            prev_a = a;
+            timer_a_changes++;
+            last_timer_a = a;
+        }
+    }
+
+    if (!raw_lv_settings_still_valid())
+    {
+        printf("vsync: LV RAW settings changed, stopping.\n");
+        raw_recording_state = RAW_FINISHING;
+        return 0;
+    }
     if (buffer_full) return 0;
+
+    static int vsync_phase = 0;
+    if (vsync_phase++ % rec_frame_skip()) return 0;
     
     /* double-buffering */
     raw_lv_redirect_edmac(fullsize_buffers[fullsize_buffer_pos % 2]);
@@ -2965,6 +3362,8 @@ unsigned int FAST raw_rec_vsync_cbr(unsigned int unused)
 static REQUIRES(LiveViewTask)
 unsigned int FAST raw_rec_vsync_setparam_cbr(unsigned int unused)
 {
+    photo_lv_24p_step();
+
     if (use_h264_proxy() && (RAW_IS_PREPARING || RAW_IS_FINISHING))
     {
         /* blacken the H.264 frames that won't end up in the RAW clip */
@@ -3078,12 +3477,13 @@ void init_mlv_chunk_headers(struct raw_info *raw_info)
         file_hdr[i].fileNum = 0;
         file_hdr[i].fileCount = 0; //autodetect
         file_hdr[i].fileFlags = 4;
+        /* M50 lossless = Canon CRX (CR3) planes, not LJ92: own flag 0x1000, see tools/crx */
         file_hdr[i].videoClass = MLV_VIDEO_CLASS_RAW |
-            (OUTPUT_COMPRESSION ? MLV_VIDEO_CLASS_FLAG_LJ92 : 0);
+            (OUTPUT_COMPRESSION ? (is_camera("M50", "*") ? (0x1000 | (output_format >= OUTPUT_12BIT_LOSSLESS ? 0x2000 : 0)) : MLV_VIDEO_CLASS_FLAG_LJ92) : 0);
         file_hdr[i].audioClass = 0;
         file_hdr[i].videoFrameCount = 0; //autodetect
         file_hdr[i].audioFrameCount = 0;
-        int fps = fps_get_current_x1000();
+        int fps = rec_fps_x1000();
         if (fps == 0)
             file_hdr[i].sourceFpsNom = 1;
         else
@@ -3129,6 +3529,11 @@ void init_mlv_chunk_headers(struct raw_info *raw_info)
 
     mlv_fill_idnt(&idnt_hdr, mlv_start_timestamp);
     mlv_fill_expo(&expo_hdr, mlv_start_timestamp);
+    if (photo_lv_24p() && (photo_lv_tab_entry || photo_lv_fix_applied) && photo_lv_shutter_lines())
+    {
+        /* our photo-LV shutter, not Canon's photo setting (shutterValue in us, see mlv.c) */
+        expo_hdr.shutterValue = photo_lv_shutter_lines() * M50_US_PER_LINE_X100 / 100;
+    }
     mlv_fill_lens(&lens_hdr, mlv_start_timestamp);
     mlv_fill_rtci(&rtci_hdr, mlv_start_timestamp);
     mlv_fill_wbal(&wbal_hdr, mlv_start_timestamp);
@@ -3354,6 +3759,7 @@ void raw_video_rec_task(uint32_t card_index)
     int last_block_size = 0; /* for detecting early stops */
     int liveview_hacked = 0;
     int last_write_timestamp = 0; /* last FIO_WriteFile call */
+    int crx_write_count = 0;      /* lossless: writes in this take, for the slow-write log */
     int last_processed_frame = 0;
     int fps = 1;
 
@@ -3394,6 +3800,22 @@ void raw_video_rec_task(uint32_t card_index)
         /* note: rec_trigger is implemented via pre_recording */
         pre_record_triggered = !pre_record && !rec_trigger;
         pre_record_first_frame = 0;
+
+        if (PHOTO_LV_LAZY_ALLOC)
+        {
+            /* ask the polling cbr for Canon's shoot memory, wait up to 5 s */
+            photo_lv_alloc = 1;
+            for (int t = 0; t < 50 && !shoot_mem_suite && !srm_mem_suite; t++)
+            {
+                msleep(100);
+            }
+            printf("Photo LV: memory %s\n", (shoot_mem_suite || srm_mem_suite) ? "OK" : "timeout");
+            if (!shoot_mem_suite && !srm_mem_suite)
+            {
+                NotifyBox(3000, "No memory for RAW");
+                goto cleanup;
+            }
+        }
 
         if (use_h264_proxy())
         {
@@ -3463,7 +3885,7 @@ void raw_video_rec_task(uint32_t card_index)
             beep();
         }
 
-        fps = fps_get_current_x1000();
+        fps = rec_fps_x1000();
         if (fps == 0)
             goto cleanup;
 
@@ -3641,6 +4063,14 @@ void raw_video_rec_task(uint32_t card_index)
             }
         }
         
+        /* lossless: after a card stall the frame_limit above may not work yet (measured speed stays 0
+         * until the status code updates it, and a whole-queue group keeps every slot busy until it is
+         * written: M05-1224 stopped at frame 30 with an 18-frame group). Small groups free slots sooner. */
+        if (OUTPUT_COMPRESSION && num_frames > CRX_MAX_WRITE_GROUP)
+        {
+            num_frames = CRX_MAX_WRITE_GROUP;
+        }
+
         int after_last_grouped = MOD(w_head + num_frames, COUNT(writing_queue));
 
         // remove these frames from the queue
@@ -3694,6 +4124,13 @@ void raw_video_rec_task(uint32_t card_index)
         
         last_write_timestamp = get_ms_clock();
         writing_time[card_index] += last_write_timestamp - t0;
+
+        crx_write_count++;
+        if (OUTPUT_COMPRESSION && (crx_write_count == 1 || last_write_timestamp - t0 > 300))
+        {
+            printf("CRX write %d: %d frames, %d KB, %d ms, free slots %d\n", crx_write_count, num_frames,
+                   group_size / 1024, last_write_timestamp - t0, free_slots);
+        }
 
         /* for detecting early stops */
         last_block_size = MOD(after_last_grouped - w_head, COUNT(writing_queue));
@@ -3918,6 +4355,37 @@ abort_and_check_early_stop:
     }
 
 cleanup:
+    if (PHOTO_LV_LAZY_ALLOC)
+    {
+        printf("Photo LV: timer A changes %d (last %x), 24p override %s, VD fix %d (VSize %x rate %x AC %d / %d, want %d)\n",
+               timer_a_changes, last_timer_a, photo_lv_24p() ? "on" : "off", photo_lv_fix_applied,
+               *(volatile uint32_t *) M50_RAM_VSIZE, *(volatile uint32_t *) M50_RAM_ESYNC_RATE,
+               ((volatile uint16_t *) M50_RAM_VD)[7], *(volatile uint32_t *) M50_RAM_AC,
+               photo_lv_shutter_lines());
+        uint32_t fdp = *(volatile uint32_t *) M50_FRAMEDATA_PTR;
+        if (fdp >= 0x1000 && fdp < 0x40000000 && !(fdp & 1))
+        {
+            volatile uint16_t *fd = (volatile uint16_t *) fdp;
+            printf("Photo LV: FrameData %x %x %x %x %x %x, expcode %x\n",
+                   fd[0], fd[1], fd[2], fd[3], fd[4], fd[5], photo_lv_expcodes[photo_lv_expcode]);
+        }
+        printf("Photo LV: VD table entry %x, VD %x, m_VSize %x, angle AC %d\n",
+               photo_lv_tab_entry ? *photo_lv_tab_entry : 0, ((volatile uint16_t *) M50_RAM_VD)[0],
+               *(volatile uint32_t *) M50_RAM_VSIZE, photo_lv_shutter_lines());
+        /* x5 test (2026-11-07): magnify, raw readout, recorded window, Canon seq mode/rate, timers, fps */
+        printf("Photo LV: zoom x%d, raw %dx%d active %dx%d, window %dx%d at %d,%d, seq mode %d rate %d, timer A %x B %x, fps %d.%03d, frame skip %d\n",
+               lv_dispsize, raw_info.width, raw_info.height,
+               raw_info.active_area.x2 - raw_info.active_area.x1, raw_info.active_area.y2 - raw_info.active_area.y1,
+               res_x, res_y, skip_x, skip_y,
+               *(volatile uint32_t *) M50_VD_SEQ_MODE, *(volatile uint16_t *) M50_VD_SEQ_RATE,
+               *(volatile uint32_t *) M50_FPS_TIMER_A, *(volatile uint32_t *) M50_FPS_TIMER_B,
+               fps_get_current_x1000() / 1000, fps_get_current_x1000() % 1000, rec_frame_skip());
+        timer_a_changes = 0;
+    }
+    /* card speed actually achieved by this take (FIO_WriteFile time only) */
+    printf("Take: %d frames, %d MB written, write time %d ms, %d MB/s\n",
+           frame_count, (int)(written_total[card_index] >> 20), writing_time[card_index],
+           writing_time[card_index] ? (int)((written_total[card_index] >> 10) * 1000 / writing_time[card_index] >> 10) : 0);
     if (f)
         finish_chunk(f, card_index);
     if (!written_total[card_index]
@@ -3933,6 +4401,10 @@ cleanup:
         free_buffers();
         restore_bit_depth();
         give_semaphore(settings_sem);
+        photo_lv_alloc = 0;
+
+        /* don't rely on a Canon state change to reallocate (M50 has none here) */
+        realloc_after_recording = 1;
 
         /* everything saved, we can unlock the buttons */
         gui_uilock(UILOCK_NONE);
@@ -4037,6 +4509,45 @@ static struct menu_entry raw_video_menu[] =
                 .max = COUNT(aspect_ratio_presets_num) - 1,
                 .update = aspect_ratio_update,
                 .choices = aspect_ratio_choices,
+            },
+            {
+                .name       = "Photo mode LV (Open Gate)",
+                .priv       = &allow_photo_lv,
+                .max        = 1,
+                .help       = "Also record from photo-mode LiveView (dial M, 3:2 = full sensor).",
+                .help2      = "Vertically squeezed 5:3; MLV players desqueeze from the RAWC block.",
+            },
+            {
+                .name       = "Photo mode LV FPS",
+                .priv       = &photo_lv_fps,
+                .max        = 2,
+                .choices    = CHOICES("23.976", "29.97", "OFF (60, skip 1/2)"),
+                .help       = "Sensor frame rate in photo-mode LV (timer B 0xD04061A4 rewritten every frame).",
+                .help2      = "OFF = Canon's 59.94, every 2nd frame recorded (29.97p).",
+            },
+            {
+                .name       = "Shutter angle",
+                .priv       = &photo_lv_shutter,
+                .max        = 9,
+                .choices    = CHOICES("Canon (auto)", "45 (1/192)", "90 (1/96)", "120 (1/72)", "144 (1/60)",
+                                      "172.8 (1/50)", "180 (1/48)", "216 (1/40)", "270 (1/32)", "345 (1/25)"),
+                .help       = "RAW shutter angle in photo-mode LV (1/x shown for 23.976; 30p is faster).",
+                .help2      = "Sets Canon FrameData exposure (sensor follows). Canon (auto) = Canon's AE.",
+            },
+            {
+                .name       = "Exposure code (test)",
+                .priv       = &photo_lv_expcode,
+                .max        = 5,
+                .choices    = CHOICES("OFF (Canon)", "0x1B00", "0x1800", "0x1500", "0x1200", "0x0F00"),
+                .help       = "EXPERIMENT: force Canon FrameData[0] every frame in photo LV 24p.",
+                .help2      = "Codes are 1 stop apart (0x300). Keep Shutter angle = Canon (auto).",
+            },
+            {
+                .name       = "Photo LV VD fix (exp.)",
+                .priv       = &photo_lv_vdfix,
+                .max        = 1,
+                .help       = "EXPERIMENTAL: also set Canon VSize/VD + ESync rate to movie 24p values.",
+                .help2      = "Made the low-ISO dark band bigger in tests. Keep OFF; use ISO 800+.",
             },
             {
                 .name       = "Data format",
@@ -4181,12 +4692,24 @@ unsigned int raw_rec_keypress_cbr(unsigned int key)
     if (!raw_video_enabled)
         return 1;
 
-    if (!is_movie_mode())
+    if (!RAW_LV_MODE_OK)
         return 1;
 
     /* keys are only hooked in LiveView */
     if (!liveview_display_idle() && !RECORDING_RAW)
+    {
+        /* M50 photo LV: REC fell through to Canon H.264 once (2026-11-04, MVI_8337.MP4);
+         * log why, and don't let Canon start a movie while RAW video owns photo LV */
+        if (PHOTO_LV_LAZY_ALLOC && (key == MODULE_KEY_REC || key == MODULE_KEY_LV))
+        {
+            printf("REC ignored: LV not idle (menu %d, gui_state %d, job_ready %d, VD fix %d)\n",
+                   menu_active_and_not_hidden(), gui_state, job_state_ready_to_take_pic(),
+                   photo_lv_fix_applied);
+            NotifyBox(2000, "RAW: LiveView busy, press REC again");
+            return 0;
+        }
         return 1;
+    }
 
     /* if you somehow managed to start recording H.264, let it stop */
     if (RECORDING_H264 && !use_h264_proxy())
@@ -4194,6 +4717,10 @@ unsigned int raw_rec_keypress_cbr(unsigned int key)
     
     /* block the zoom key while recording */
     if (!RAW_IS_IDLE && key == MODULE_KEY_PRESS_ZOOMIN)
+        return 0;
+
+    /* photo mode LV: don't let Canon enter playback while we hold its memory */
+    if (PHOTO_LV_LAZY_ALLOC && !RAW_IS_IDLE && key == MODULE_KEY_PLAY)
         return 0;
 
     /* start/stop recording with the LiveView key */
@@ -4205,6 +4732,25 @@ unsigned int raw_rec_keypress_cbr(unsigned int key)
     if (rec_key_pressed)
     {
         printf("REC key pressed.\n");
+
+        /* M50 photo mode: a REC press before ML is ready goes to Canon, which starts H.264 and switches
+         * LV raw to 2096x1164; RECORDING_H264 stays 0 then (2026-11-06, MVI_8345/8346). The next press
+         * started RAW on top of it (encoder timeout -15, assert, H.264 could not be stopped). */
+        if (PHOTO_LV_LAZY_ALLOC && RAW_IS_IDLE && lv_dispsize == 1)
+        {
+            if (raw_info.height > 1000)
+            {
+                printf("REC: Canon movie LV in photo mode (%dx%d), key goes to Canon\n", raw_info.width, raw_info.height);
+                NotifyBox(3000, "RAW off: Canon movie is on. REC stops it.");
+                return 1;
+            }
+            if (raw_info.height == 0)
+            {
+                printf("REC: LV raw not ready yet\n");
+                NotifyBox(2000, "RAW not ready, press REC again");
+                return 0;
+            }
+        }
 
         if (!compress_mq)
         {
@@ -4334,6 +4880,13 @@ unsigned int raw_rec_keypress_cbr_raw(unsigned int raw_event)
         }
     }
 
+    /* M50 AF test: log every GUI event while recording in photo LV
+     * (full-shutter code unknown on M50, needed to block captures) */
+    if (PHOTO_LV_LAZY_ALLOC && !RAW_IS_IDLE)
+    {
+        printf("rec event 0x%x %s\n", event->param, IS_FAKE(event) ? "(fake)" : "");
+    }
+
     int key = module_translate_key(event->param, MODULE_KEY_PORTABLE);
     return raw_rec_keypress_cbr(key);
 }
@@ -4343,7 +4896,7 @@ static int preview_dirty = 0;
 static int raw_rec_should_preview(void)
 {
     if (!raw_video_enabled) return 0;
-    if (!is_movie_mode()) return 0;
+    if (!RAW_LV_MODE_OK) return 0;
 
     /* keep x10 mode unaltered, for focusing */
     if (lv_dispsize == 10) return 0;
@@ -4493,8 +5046,20 @@ static struct lvinfo_item info_items[] = {
     }
 };
 
+/* core hook (state-object.c): runs just before evfSetParamInterrupt reads FrameData */
+extern void (*evf_setparam_pre_hook)(void);
+
+static void photo_lv_setparam_pre()
+{
+    if (photo_lv_24p() && photo_lv_tab_entry)
+        photo_lv_angle_step();
+}
+
 static unsigned int raw_rec_init()
 {
+    /* photo_lv_24p() itself only matches the M50 photo-LV timer state */
+    evf_setparam_pre_hook = photo_lv_setparam_pre;
+
     cam_eos_m = is_camera("EOSM", "2.0.2");
     cam_5d2   = is_camera("5D2",  "2.1.2");
     cam_50d   = is_camera("50D",  "1.0.9");
@@ -4548,7 +5113,12 @@ static unsigned int raw_rec_init()
         raw_video_menu->children[11].shidden = 1; // Hide "Small hacks"
         small_hacks = 0;
     }
-    if (version != 5)
+    if (version != 5 && is_camera("M50", "*"))
+    { // M50: lossless = Canon's CRX encoder; 3 = 14-bit, 4 = 12-bit (EDMAC >> 2), 5 = 10-bit (12-bit + CRX field 2)
+        raw_video_menu->children[2].max = 5;
+        if (output_format > 5) output_format = 0;
+    }
+    else if (version != 5)
     { // so far, only Digic 5 has working lossless compression, hide on other cams
         if (raw_video_menu->children[2].max > 2)
         {
@@ -4583,7 +5153,11 @@ static unsigned int raw_rec_init()
     /* allocate queue that other modules will fill with blocks to write to the current file */
     mlv_block_queue = msg_queue_create("mlv_block_queue", 100);
 
-    lossless_init();
+    lossless_ok = lossless_init();
+    if (lossless_ok && OUTPUT_COMPRESSION_REQUESTED)
+    {
+        lossless_m50_prealloc();   /* M50 CRX: before any shoot memory is taken */
+    }
 
     settings_sem = create_named_semaphore(NULL, SEM_CREATE_UNLOCKED);
     if (is_card_spanning_possible)
@@ -4596,6 +5170,8 @@ static unsigned int raw_rec_init()
 
 static unsigned int raw_rec_deinit()
 {
+    if (evf_setparam_pre_hook == photo_lv_setparam_pre)
+        evf_setparam_pre_hook = 0;
     return 0;
 }
 
@@ -4625,6 +5201,11 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(dolly_mode)
     MODULE_CONFIG(preview_mode)
     MODULE_CONFIG(use_srm_memory)
+    MODULE_CONFIG(photo_lv_fps)
+    MODULE_CONFIG(photo_lv_vdfix)
+    MODULE_CONFIG(photo_lv_shutter)
+    MODULE_CONFIG(photo_lv_expcode)
+    MODULE_CONFIG(allow_photo_lv)
     MODULE_CONFIG(small_hacks)
     MODULE_CONFIG(warm_up)
     MODULE_CONFIG(sync_beep)

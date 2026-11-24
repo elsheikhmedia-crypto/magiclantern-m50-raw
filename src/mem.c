@@ -1067,6 +1067,17 @@ void srm_free_suite(struct memSuite *suite)
     _srm_free_suite(suite);
     give_semaphore(mem_sem);
 }
+#else
+/* SRM allocations crash on this camera: report no SRM memory, so callers
+ * like mlv_lite fall back to shoot memory only. */
+struct memSuite *srm_malloc_suite(int num_requested_buffers)
+{
+    return 0;
+}
+
+void srm_free_suite(struct memSuite *suite)
+{
+}
 #endif // ~CONFIG_MEMORY_SRM_NOT_WORKING
 
 struct memSuite *shoot_malloc_suite_contig(size_t size)

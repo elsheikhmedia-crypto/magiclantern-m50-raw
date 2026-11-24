@@ -185,3 +185,7 @@ extern int winsys_bmp_dirty_bit_neg;
 
 //address of XimrContext structure to redraw in FEATURE_VRAM_RGBA
 #define XIMR_CONTEXT 0x9329C
+
+/* Canon LiveView RAW state struct (from lv_raw_dump / lv_set_mm, literal 0xE080D598 and 0xE080CEEC).
+ * +0x10 width, +0x14 height, +0x58 buffer. Verified on camera: 0x6DCE7518, 2096x1164 in FHD 23.98p. */
+#define LV_RAW_STRUCT_ADDR 0x12748

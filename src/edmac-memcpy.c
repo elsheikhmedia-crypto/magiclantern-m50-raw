@@ -375,6 +375,18 @@ void* edmac_memcpy(void* dst, void* src, size_t length)
 
 #endif // CONFIG_EDMAC_MEMCPY
 
+#ifndef CONFIG_EDMAC_MEMCPY_M50
+/* bit depth conversion during EDMAC copies: only platform/M50.110/edmac-d8.c has it */
+void edmac_copy_set_output_bpp(int bpp)
+{
+}
+
+int edmac_copy_output_bpp_supported()
+{
+    return 0;
+}
+#endif
+
 /** this method bypasses Canon's lv_save_raw and slurps the raw data directly from connection #0 */
 #ifndef CONFIG_EDMAC_RAW_SLURP
 // mlv_lite requires the symbol to exist regardless of RAW_SLURP support,

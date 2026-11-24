@@ -919,6 +919,30 @@ int fps_get_current_x1000()
 {
     if (!lv)
         return 0;
+#ifdef CONFIG_FPS_FROM_VIDEO_MODE
+    /* FPS timer registers not found yet: use the frame rate measured on the
+     * EvfState vsync (photo mode LV runs at its own rate), snapped to standard rates */
+    extern int lv_vsync_fps_x1000();
+    int measured = lv_vsync_fps_x1000();
+    if (measured)
+    {
+        static const int std_fps[] = { 23976, 24000, 25000, 29970, 30000, 50000, 59940, 60000, 119880 };
+        for (int i = 0; i < (int) COUNT(std_fps); i++)
+            if (ABS(measured - std_fps[i]) * 1000 < std_fps[i] * 3)     /* within 0.3 % */
+                return std_fps[i];
+        return measured;
+    }
+
+    /* no vsync yet: Canon's nominal movie frame rate */
+    switch (video_mode_fps_x100)
+    {
+        case 2398: return 23976;
+        case 2997: return 29970;
+        case 5994: return 59940;
+        case 11988: return 119880;
+        default:   return video_mode_fps_x100 * 10;
+    }
+#endif
     int fps_timer = (get_fps_register_b() & 0xFFFF) + 1;
     int fps_x1000 = TIMER_TO_FPS_x1000(fps_timer);
     return fps_x1000;

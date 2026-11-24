@@ -77,6 +77,40 @@ static struct menu_entry script_menu[] = {
 };
 #endif
 
+#ifdef CONFIG_CONSOLE_LOG_FILE
+/* printf can run in any context (vsync, CBRs): only copy to RAM here,
+ * console_task writes it to ML/LOGS/CONSOLE.LOG every 200 ms */
+static char console_log_buf[8192];
+static volatile int console_log_len = 0;
+
+static void console_log_append(const char *str)
+{
+    uint32_t old = cli();
+    for (const char *c = str; *c && console_log_len < (int)sizeof(console_log_buf); c++)
+        console_log_buf[console_log_len++] = *c;
+    sei(old);
+}
+
+static void console_log_flush()
+{
+    static char out[sizeof(console_log_buf)];
+    uint32_t old = cli();
+    int n = console_log_len;
+    memcpy(out, console_log_buf, n);
+    console_log_len = 0;
+    sei(old);
+    if (!n)
+        return;
+
+    FILE *f = FIO_CreateFileOrAppend("ML/LOGS/CONSOLE.LOG");
+    if (f)
+    {
+        FIO_WriteFile(f, out, n);
+        FIO_CloseFile(f);
+    }
+}
+#endif
+
 void console_clear()
 {
     int i;
@@ -98,6 +132,10 @@ void console_puts(const char* str) // don't DebugMsg from here!
 
     /* this only runs when compiling with CONFIG_QEMU */
     qprintf("%s", str);
+
+    #ifdef CONFIG_CONSOLE_LOG_FILE
+    console_log_append(str);
+    #endif
 
     #ifdef CONSOLE_DEBUG
     bmp_printf(FONT_MED, 0, 0, "%s ", str);
@@ -292,6 +330,9 @@ console_task( void* unused )
     #ifdef CONSOLE_DEBUG
     console_show();
     #endif
+    #ifdef CONFIG_CONSOLE_LOG_FILE
+    console_log_append("\n===== boot =====\n");
+    #endif
     int dirty = 0;
     TASK_LOOP
     {
@@ -310,6 +351,10 @@ console_task( void* unused )
         {
             console_draw(1);
         }
+
+        #ifdef CONFIG_CONSOLE_LOG_FILE
+        console_log_flush();
+        #endif
 
         msleep(200);
     }
